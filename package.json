@@ -1,0 +1,32 @@
+{
+  "name": "event-sourcing-using-eventstoredb",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dev:start": "npx ts-node src/index.ts",
+    "docker:start": "docker run --name esdb-node -it -p 2113:2113 -p 1113:1113 eventstore/eventstore:latest --insecure --run-projections=All --enable-external-tcp --enable-atom-pub-over-http",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zankyr/event-sourcing-using-eventstoredb.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/zankyr/event-sourcing-using-eventstoredb/issues"
+  },
+  "homepage": "https://github.com/zankyr/event-sourcing-using-eventstoredb#readme",
+  "devDependencies": {
+    "@types/node": "^18.11.18",
+    "@types/uuid": "^9.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^4.9.5"
+  },
+  "dependencies": {
+    "@eventstore/db-client": "^5.0.0",
+    "uuid": "^9.0.0"
+  }
+}
