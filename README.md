@@ -2,7 +2,13 @@
 
 An example on how implement an [event-sourcing](https://martinfowler.com/eaaDev/EventSourcing.html) application using Typescript adn [EventStoreDB](https://www.eventstore.com/eventstoredb).
 
-## How-to
+<!-- TOC -->
+* [event-sourcing-using-eventstoredb](#event-sourcing-using-eventstoredb)
+  * [How-to](#how-to)
+    * [Setup and launch the project](#setup-and-launch-the-project)
+<!-- TOC -->
+
+## Setup and launch the project
 
 1 - Clone the repository and install the dependencies
 
@@ -13,16 +19,19 @@ $ npm install
 ```
 
 2 - Start the Docker container containing EventStoreDB
+
 ```shell
 $ npm run docker:start
 ```
 
 3 - Start the application
+
 ```shell
 $ npm run dev:start
 ```
 
 4 - In the terminal you should see something similar:
+
 ```shell
 user in ~/dev/src/event-sourcing-using-eventstoredb on main [?]
 $ npm run dev:start
@@ -43,3 +52,9 @@ $ npm run dev:start
 
 5 - In your browser, open the address [http://localhost:2113/](http://localhost:2113) to reach the EventStoreDB GUI and check the stream:
 ![](./doc/eventstoredb-gui.png)
+
+
+## Try the scenarios
+Currently, the project has two scenarios:
+1. Checkpoint 1: a static event stream is loaded when the application is launched
+2. Checkpoint 2: events are created through API calls
