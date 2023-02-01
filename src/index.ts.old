@@ -1,0 +1,827 @@
+import {
+  AllStreamResolvedEvent,
+  AppendResult,
+  EventStoreDBClient,
+  EventType,
+  excludeSystemEvents,
+  jsonEvent,
+  JSONEventType,
+  NO_STREAM,
+  RecordedEvent,
+  ResolvedEvent,
+  START,
+  StreamingRead,
+} from "@eventstore/db-client";
+
+import express, {
+  NextFunction,
+  Request,
+  Response,
+  Application,
+  Router,
+  response,
+} from "express";
+
+import { v4 as uuid } from "uuid";
+
+import http from "http";
+import { Collection, MongoClient, Document, ObjectId } from "mongodb";
+
+/***************************************
+ **************  EVENTS  ***************
+ ***************************************/
+// All these types are Readonly because events should be immutable
+type ShoppingCartOpened = JSONEventType<
+  "shopping-cart-opened",
+  Readonly<{
+    shoppingCartId: string;
+    clientId: string;
+    openedAt: Date;
+  }>
+>;
+
+type ProductItemAddedToShoppingCart = JSONEventType<
+  "product-item-added-to-shopping-cart",
+  Readonly<{
+    shoppingCartId: string;
+    productItem: ProductItem;
+  }>
+>;
+type ProductItemRemovedFromShoppingCart = JSONEventType<
+  "product-item-removed-from-shopping-cart",
+  Readonly<{
+    shoppingCartId: string;
+    productItem: ProductItem;
+  }>
+>;
+
+type ShoppingCartConfirmed = JSONEventType<
+  "shopping-cart-confirmed",
+  Readonly<{
+    shoppingCartId: string;
+    confirmedAt: Date;
+  }>
+>;
+
+type ProductItem = {
+  productId: string;
+  quantity: number;
+};
+
+type ShoppingCartEvent =
+  | ShoppingCartOpened
+  | ProductItemAddedToShoppingCart
+  | ProductItemRemovedFromShoppingCart
+  | ShoppingCartConfirmed;
+
+/***************************************
+ *********  STATES (ENTITIES)  *********
+ ***************************************/
+type ShoppingCart = Readonly<{
+  id: string;
+  clientId: string;
+  status: ShoppingCartStatus;
+  productItems: ProductItem[];
+  openedAt: Date;
+  confirmedAt?: Date;
+}>;
+
+enum ShoppingCartStatus {
+  Opened = 1,
+  Confirmed = 2,
+  Cancelled = 4,
+  Closed = Confirmed | Cancelled,
+}
+
+const toShoppingCartStreamName = (shoppingCartId: string) =>
+  `shopping_cart-${shoppingCartId}`;
+
+// Transformation/application method
+// In ES this method is also called 'when'
+// This method takes the current state, which could be undefined, and an event,
+// and returns the new current state, as a result of applying the event to the current state
+type ApplyEvent<Entity, E extends EventType> = (
+  currentState: Entity | undefined,
+  event: RecordedEvent<E>
+) => Entity;
+
+// This method takes a list of events (for example, reading from the event store)
+// and for each of them it applies the 'when' argument (defined as the 'ApplyEvent' above)
+const StreamAggregator =
+  <Entity, E extends EventType>(when: ApplyEvent<Entity, E>) =>
+  async (eventStream: StreamingRead<ResolvedEvent<E>>): Promise<Entity> => {
+    let currentState: Entity | undefined = undefined;
+
+    for await (const { event } of eventStream) {
+      if (!event) continue;
+      currentState = when(currentState, event);
+    }
+
+    if (currentState == null) throw StreamAggregatorError.STREAM_WAS_NOT_FOUND;
+
+    return currentState;
+  };
+
+const enum StreamAggregatorError {
+  STREAM_WAS_NOT_FOUND,
+}
+
+const enum ShoppingCartError {
+  OPENED_EXISTING_CART = "OPENED_EXISTING_CART",
+  UNKNOW_EVENT_TYPE = "UNKNOW_EVENT_TYPE",
+  CART_NOT_FOUND = "CART_NOT_FOUND",
+  PRODUCT_ITEM_NOT_FOUND = "PRODUCT_ITEM_NOT_FOUND",
+  CART_IS_ALREADY_CLOSED = "CART_IS_ALREADY_CLOSED",
+}
+
+const getShoppingCart = StreamAggregator<ShoppingCart, ShoppingCartEvent>(
+  (currentState, event) => {
+    // Opening a cart is a special case, we need to assure that no previous state exists and then we return a default entity
+    if (event.type === "shopping-cart-opened") {
+      if (currentState != null) throw ShoppingCartError.OPENED_EXISTING_CART;
+      return {
+        id: event.data.shoppingCartId,
+        clientId: event.data.clientId,
+        openedAt: new Date(event.data.openedAt),
+        productItems: [],
+        status: ShoppingCartStatus.Opened,
+      };
+    }
+
+    // If at this point no state exists, we throw an error
+    if (currentState == null) throw ShoppingCartError.CART_NOT_FOUND;
+
+    switch (event.type) {
+      case "product-item-added-to-shopping-cart":
+        return {
+          ...currentState,
+          productItems: addProductItem(
+            currentState.productItems,
+            event.data.productItem
+          ),
+        };
+      case "product-item-removed-from-shopping-cart":
+        return {
+          ...currentState,
+          productItems: removeProductItem(
+            currentState.productItems,
+            event.data.productItem
+          ),
+        };
+      case "shopping-cart-confirmed":
+        return {
+          ...currentState,
+          status: ShoppingCartStatus.Confirmed,
+          confirmedAt: new Date(event.data.confirmedAt),
+        };
+      default: {
+        const _: never = event;
+        throw ShoppingCartError.UNKNOW_EVENT_TYPE;
+      }
+    }
+  }
+);
+
+/*
+ * Add a product item to the current list:
+ * - if the list doesn't contain the specified item, just add it with the provided quantity;
+ * - if the list already contain the specified item, udpate its quantity
+ */
+const addProductItem = (
+  productItems: ProductItem[],
+  newProductItem: ProductItem
+): ProductItem[] => {
+  const { productId, quantity } = newProductItem;
+
+  const currentProductItem = findProductItem(productItems, productId);
+
+  if (!currentProductItem) return [...productItems, newProductItem];
+
+  const newQuantity = currentProductItem.quantity + quantity;
+  const mergedProductItem = { productId, quantity: newQuantity };
+
+  return productItems.map((pi) =>
+    pi.productId === productId ? mergedProductItem : pi
+  );
+};
+
+const findProductItem = (
+  productItems: ProductItem[],
+  productId: string
+): ProductItem | undefined => {
+  return productItems.find((pi) => pi.productId === productId);
+};
+
+/*
+ * Remove a product item from the current list:
+ * - if the list doesn't contain the specified item, or the quantity of the item to remove is larger than the current quantity, throws an error;
+ * - otherwise reduce the current quantity by the specified quantity
+ *
+ * If the quantity after the removal is equal to zero, remove the item from the list.
+ */
+const removeProductItem = (
+  productItems: ProductItem[],
+  productItemToRemove: ProductItem
+): ProductItem[] => {
+  const { productId, quantity } = productItemToRemove;
+
+  const currentProductItem = assertProductItemExists(
+    productItems,
+    productItemToRemove
+  );
+
+  const newQuantity = currentProductItem.quantity - quantity;
+
+  if (newQuantity === 0) {
+    return productItems.filter((pi) => pi.productId !== productId);
+  }
+
+  const mergedProductItem = { productId, quantity: newQuantity };
+  return productItems.map((pi) =>
+    pi.productId === productId ? mergedProductItem : pi
+  );
+};
+
+/***************************************
+ *********     VALIDATIONS     *********
+ ***************************************/
+
+const enum ValidationError {
+  NOT_A_NONEMPTY_STRING = "NOT_A_NONEMPTY_STRING",
+  NOT_A_POSITIVE_NUMBER = "NOT_A_POSITIVE_NUMBER",
+  NOT_AN_UNSIGNED_BIGINT = "NOT_AN_UNSIGNED_BIGINT",
+}
+
+const assertProductItemExists = (
+  productItems: ProductItem[],
+  { productId, quantity }: ProductItem
+): ProductItem => {
+  const currentProductItem = findProductItem(productItems, productId);
+
+  if (!currentProductItem || currentProductItem.quantity < quantity) {
+    throw ShoppingCartError.PRODUCT_ITEM_NOT_FOUND;
+  }
+
+  return currentProductItem;
+};
+
+const assertShoppingCartIsNotClosed = (shoppingCart: ShoppingCart) => {
+  if (
+    (shoppingCart.status & ShoppingCartStatus.Closed) ===
+    ShoppingCartStatus.Closed
+  )
+    throw ShoppingCartError.CART_IS_ALREADY_CLOSED;
+};
+
+const assertNotEmptyString = (value: any): string => {
+  if (typeof value !== "string" || value.length === 0) {
+    throw ValidationError.NOT_A_NONEMPTY_STRING;
+  }
+
+  return value;
+};
+
+const assertPositiveNumber = (value: any): number => {
+  if (typeof value !== "number" || value <= 0) {
+    throw ValidationError.NOT_A_POSITIVE_NUMBER;
+  }
+
+  return value;
+};
+
+export const assertUnsignedBigInt = (value: string): bigint => {
+  const number = BigInt(value);
+  if (number < 0) {
+    throw ValidationError.NOT_AN_UNSIGNED_BIGINT;
+  }
+
+  return number;
+};
+
+/***************************************
+ *********     COMMANDS        *********
+ ***************************************/
+type OpenShoppingCart = {
+  shoppingCartId: string;
+  clientId: string;
+};
+
+const openShoppingCart = ({
+  shoppingCartId,
+  clientId,
+}: OpenShoppingCart): ShoppingCartOpened => {
+  return {
+    type: "shopping-cart-opened",
+    data: {
+      shoppingCartId,
+      clientId,
+      openedAt: new Date(),
+    },
+  };
+};
+
+type AddProductItemToShoppingCart = {
+  shoppingCartId: string;
+  productItem: ProductItem;
+};
+
+const addProductItemToShoppingCart = async (
+  events: StreamingRead<ResolvedEvent<ShoppingCartEvent>>,
+  { shoppingCartId, productItem }: AddProductItemToShoppingCart
+): Promise<ProductItemAddedToShoppingCart> => {
+  const shoppingCart = await getShoppingCart(events);
+
+  assertShoppingCartIsNotClosed(shoppingCart);
+
+  return {
+    type: "product-item-added-to-shopping-cart",
+    data: {
+      shoppingCartId,
+      productItem,
+    },
+  };
+};
+
+type RemoveProductItemFromShoppingCart = {
+  shoppingCartId: string;
+  productItem: ProductItem;
+};
+
+const removeProductItemFromShoppingCart = async (
+  events: StreamingRead<ResolvedEvent<ShoppingCartEvent>>,
+  { shoppingCartId, productItem }: RemoveProductItemFromShoppingCart
+): Promise<ProductItemRemovedFromShoppingCart> => {
+  const shoppingCart = await getShoppingCart(events);
+
+  assertShoppingCartIsNotClosed(shoppingCart);
+  assertProductItemExists(shoppingCart.productItems, productItem);
+
+  return {
+    type: "product-item-removed-from-shopping-cart",
+    data: {
+      shoppingCartId,
+      productItem,
+    },
+  };
+};
+
+type ConfirmShoppingCart = {
+  shoppingCartId: string;
+};
+
+const confirmShoppingCart = async (
+  events: StreamingRead<ResolvedEvent<ShoppingCartEvent>>,
+  { shoppingCartId }: ConfirmShoppingCart
+): Promise<ShoppingCartConfirmed> => {
+  const shoppingCart = await getShoppingCart(events);
+
+  assertShoppingCartIsNotClosed(shoppingCart);
+
+  return {
+    type: "shopping-cart-confirmed",
+    data: {
+      shoppingCartId,
+      confirmedAt: new Date(),
+    },
+  };
+};
+
+/***************************************
+ *********   EVENT STORE DB    *********
+ ***************************************/
+let eventStore: EventStoreDBClient;
+
+const getEventStore = (connectionString?: string) => {
+  if (!eventStore) {
+    eventStore = EventStoreDBClient.connectionString(
+      connectionString ?? "esdb://localhost:2113?tls=false"
+    );
+  }
+
+  return eventStore;
+};
+
+const create =
+  <Command, StreamEvent extends JSONEventType>(
+    eventStore: EventStoreDBClient,
+    handle: (command: Command) => StreamEvent
+  ) =>
+  (streamName: string, command: Command): Promise<AppendResult> => {
+    const event = handle(command);
+
+    return eventStore.appendToStream(streamName, jsonEvent(event), {
+      expectedRevision: NO_STREAM,
+    });
+  };
+
+const update =
+  <Command, StreamEvent extends JSONEventType>(
+    eventStore: EventStoreDBClient,
+    handle: (
+      events: StreamingRead<ResolvedEvent<StreamEvent>>,
+      command: Command
+    ) => Promise<StreamEvent>
+  ) =>
+  async (
+    streamName: string,
+    command: Command,
+    expectedRevision: bigint
+  ): Promise<AppendResult> => {
+    const readStream = eventStore.readStream(streamName);
+
+    const event = await handle(readStream, command);
+
+    return eventStore.appendToStream(streamName, jsonEvent(event), {
+      expectedRevision,
+    });
+  };
+
+/***************************************
+ *********    HTTP HELPERS     *********
+ ***************************************/
+const sendCreated = (
+  response: Response,
+  createdId: string,
+  urlPrefix?: string
+): void => {
+  response.setHeader(
+    "Location",
+    `${urlPrefix ?? response.req.url}/${createdId}`
+  );
+  response.status(201).json({ id: createdId });
+};
+
+/***************************************
+ *********        ETAG         *********
+ ***************************************/
+type WeakETag = `W/${string}`;
+type ETag = WeakETag | string;
+
+const WeakETagRegex = /W\/"(\d+.*)"/;
+
+const enum ETagErrors {
+  WRONG_WEAK_ETAG_FORMAT = "WRONG_WEAK_ETAG_FORMAT",
+  MISSING_IF_MATCH_HEADER = "MISSING_IF_MATCH_HEADER",
+}
+
+const isWeakETag = (etag: ETag): etag is WeakETag => {
+  return WeakETagRegex.test(etag);
+};
+
+const getWeakETagValue = (etag: ETag): WeakETag => {
+  return WeakETagRegex.exec(etag)![1] as WeakETag;
+};
+
+const toWeakETag = (value: any): WeakETag => {
+  return `W/"${value}"`;
+};
+
+const getETagFromIfMatch = (request: Request): ETag => {
+  const etag = request.headers["if-match"];
+
+  if (etag === undefined) {
+    throw ETagErrors.MISSING_IF_MATCH_HEADER;
+  }
+
+  return etag;
+};
+
+const getWeakETagValueFromIfMatch = (request: Request): WeakETag => {
+  const etag = getETagFromIfMatch(request);
+
+  if (!isWeakETag(etag)) {
+    throw ETagErrors.WRONG_WEAK_ETAG_FORMAT;
+  }
+
+  return getWeakETagValue(etag);
+};
+
+const getExpectedRevisionFromETag = (request: Request): bigint =>
+  assertUnsignedBigInt(getWeakETagValueFromIfMatch(request));
+
+/***************************************
+ *********       ROUTES        *********
+ ***************************************/
+const router = Router();
+
+// Open shopping cart
+router.post(
+  "/clients/:clientId/shopping-carts",
+  async (request: Request, response: Response, next: NextFunction) => {
+    try {
+      const shoppingCartId = uuid();
+      const streamName = toShoppingCartStreamName(shoppingCartId);
+
+      const result = await create(getEventStore(), openShoppingCart)(
+        streamName,
+        {
+          shoppingCartId,
+          clientId: assertNotEmptyString(request.params.clientId),
+        }
+      );
+
+      response.set("ETag", toWeakETag(result.nextExpectedRevision));
+      sendCreated(response, shoppingCartId);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+// Add item to shopping cart
+router.post(
+  "/clients/:clientId/shopping-carts/:shoppingCartId/product-items",
+  async (request: Request, response: Response, next: NextFunction) => {
+    try {
+      const shoppingCartId = assertNotEmptyString(
+        request.params.shoppingCartId
+      );
+      const streamName = toShoppingCartStreamName(shoppingCartId);
+      const expectedRevision = getExpectedRevisionFromETag(request);
+
+      const result = await update(
+        getEventStore(),
+        addProductItemToShoppingCart
+      )(
+        streamName,
+        {
+          shoppingCartId,
+          productItem: {
+            productId: assertNotEmptyString(request.body.productId),
+            quantity: assertPositiveNumber(request.body.quantity),
+          },
+        },
+        expectedRevision
+      );
+
+      response.set("ETag", toWeakETag(result.nextExpectedRevision));
+      response.sendStatus(200);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Remove item to shopping cart
+router.delete(
+  "/clients/:clientId/shopping-carts/:shoppingCartId/product-items",
+  async (request: Request, response: Response, next: NextFunction) => {
+    try {
+      const shoppingCartId = assertNotEmptyString(
+        request.params.shoppingCartId
+      );
+      const streamName = toShoppingCartStreamName(shoppingCartId);
+      const expectedRevision = getExpectedRevisionFromETag(request);
+
+      const result = await update(
+        getEventStore(),
+        removeProductItemFromShoppingCart
+      )(
+        streamName,
+        {
+          shoppingCartId,
+          productItem: {
+            productId: assertNotEmptyString(request.body.productId),
+            quantity: assertPositiveNumber(request.body.quantity),
+          },
+        },
+        expectedRevision
+      );
+
+      response.set("ETag", toWeakETag(result.nextExpectedRevision));
+      response.sendStatus(200);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Confirm shopping cart
+router.put(
+  "/clients/:clientId/shopping-carts/:shoppingCartId",
+  async (request: Request, response: Response, next: NextFunction) => {
+    try {
+      const shoppingCartId = assertNotEmptyString(
+        request.params.shoppingCartId
+      );
+      const streamName = toShoppingCartStreamName(shoppingCartId);
+      const expectedRevision = getExpectedRevisionFromETag(request);
+
+      const result = await update(getEventStore(), confirmShoppingCart)(
+        streamName,
+        {
+          shoppingCartId,
+        },
+        expectedRevision
+      );
+
+      response.set("ETag", toWeakETag(result.nextExpectedRevision));
+      response.sendStatus(200);
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+///////////////////////////////////////
+/////    Subscriptions
+///////////////////////////////////////
+
+type SubscriptionResolvedEvent = AllStreamResolvedEvent & {
+  subscriptionId: string;
+};
+
+type EventHandler = (event: SubscriptionResolvedEvent) => Promise<void>;
+
+const SubscriptionsToAll =
+  (
+    eventStore: EventStoreDBClient,
+    loadCheckpoint: (subscriptionId: string) => Promise<bigint | undefined>
+  ) =>
+  async (subscriptionId: string, handlers: EventHandler[]) => {
+    const currentPosition = await loadCheckpoint(subscriptionId);
+    const fromPosition = !currentPosition
+      ? START
+      : { prepare: currentPosition, commit: currentPosition };
+
+    const subscription = eventStore.subscribeToAll({
+      fromPosition,
+      filter: excludeSystemEvents(),
+    });
+
+    subscription
+      .on("data", async (resolvedEvent: AllStreamResolvedEvent) => {
+        for (const handler of handlers) {
+          await handler({ ...resolvedEvent, subscriptionId });
+        }
+      })
+      .on("error", async (error) => {
+        console.error(`Received error: ${error ?? "UNEXPECTED ERROR"}.`);
+      })
+      .on("close", async () => {
+        console.info("Subscription closed.");
+      });
+  };
+
+type ShoppingCartDetails = Readonly<{
+  shoppingCartId: string;
+  clientId: string;
+  status: string;
+  productItems: ProductItem[];
+  openedAt: string;
+  confirmedAt?: string;
+  revision: number;
+}>;
+
+const getShoppingCartsCollection = () => {
+  getMongoCollection<ShoppingCartDetails>("shoppingCartDetails");
+};
+
+///////////////////////////////////////
+/////    MONGO DB
+///////////////////////////////////////
+let mongoClient: MongoClient;
+
+const getMongoDB = async (connectionString?: string): Promise<MongoClient> => {
+  if (!mongoClient) {
+    mongoClient = new MongoClient(
+      connectionString ?? "mongodb://localhost:27017"
+    );
+
+    await mongoClient.connect();
+  }
+
+  return mongoClient;
+};
+
+type ExecuteOnMongoDBOptions =
+  | {
+      collectionName: string;
+      databaseName?: string;
+    }
+  | string;
+
+const getMongoCollection = async <Doc extends Document>(
+  options: ExecuteOnMongoDBOptions
+): Promise<Collection<Doc>> => {
+  const mongo = await getMongoDB();
+
+  const { databaseName, collectionName } =
+    typeof options !== "string"
+      ? options
+      : { databaseName: undefined, collectionName: options };
+
+  const db = mongo.db(databaseName);
+  return db.collection<Doc>(collectionName);
+};
+
+const toObjectId = (id: string) => id as unknown as ObjectId;
+
+const enum MongoDBError {
+  FAILED_TO_UPDATE_DOCUMENT = "FAILED_TO_UPDATE_DOCUMENT",
+  DOCUMENT_NOT_FOUND = "DOCUMENT_NOT_FOUND",
+}
+
+///////////////////////////////////////
+/////    API
+///////////////////////////////////////
+const startAPI = (router: Router) => {
+  const app: Application = express();
+
+  app.set("etag", false);
+  app.use(express.json());
+  app.use(
+    express.urlencoded({
+      extended: true,
+    })
+  );
+  app.use(router);
+
+  const server = http.createServer(app);
+  server.listen(3000);
+  server.on("listening", () => {
+    console.info("Server up listening");
+  });
+};
+
+startAPI(router);
+
+/***************************************
+ *********         RUN         *********
+ ***************************************/
+const enum ProductsIds {
+  T_SHIRT = "team-building-exercise-2023",
+  SHOES = "air-jordan",
+}
+
+(async () => {
+  const clientId = "client-123";
+  const shoppingCartId = `cart-${uuid()}`;
+
+  // Already existing stream of events
+  const events: ShoppingCartEvent[] = [
+    {
+      type: "shopping-cart-opened",
+      data: {
+        shoppingCartId,
+        clientId,
+        openedAt: new Date(),
+      },
+    },
+    {
+      type: "product-item-added-to-shopping-cart",
+      data: {
+        shoppingCartId,
+        productItem: {
+          productId: ProductsIds.SHOES,
+          quantity: 1,
+        },
+      },
+    },
+    {
+      type: "product-item-added-to-shopping-cart",
+      data: {
+        shoppingCartId,
+        productItem: {
+          productId: ProductsIds.T_SHIRT,
+          quantity: 3,
+        },
+      },
+    },
+    {
+      type: "product-item-removed-from-shopping-cart",
+      data: {
+        shoppingCartId,
+        productItem: {
+          productId: ProductsIds.SHOES,
+          quantity: 1,
+        },
+      },
+    },
+    {
+      type: "shopping-cart-confirmed",
+      data: {
+        shoppingCartId,
+        confirmedAt: new Date(),
+      },
+    },
+  ];
+
+  const streamName = toShoppingCartStreamName(shoppingCartId);
+
+  // Event store connection
+  const eventStore = EventStoreDBClient.connectionString(
+    "esdb://localhost:2113?tls=false"
+  );
+
+  await eventStore.appendToStream<ShoppingCartEvent>(
+    streamName,
+    events.map((e) => jsonEvent<ShoppingCartEvent>(e))
+  );
+
+  const shoppingCartStream =
+    eventStore.readStream<ShoppingCartEvent>(streamName);
+
+  const cart = await getShoppingCart(shoppingCartStream);
+
+  console.log(cart);
+})();
