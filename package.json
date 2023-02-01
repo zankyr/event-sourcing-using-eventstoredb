@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev:start": "npx ts-node src/index.ts",
-    "docker:start": "docker run --name esdb-node -it -p 2113:2113 -p 1113:1113 eventstore/eventstore:latest --insecure --run-projections=All --enable-external-tcp --enable-atom-pub-over-http",
+    "docker:start": "docker run --name esdb-node -it --rm -p 2113:2113 -p 1113:1113 eventstore/eventstore:latest --insecure --run-projections=All --enable-external-tcp --enable-atom-pub-over-http",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
